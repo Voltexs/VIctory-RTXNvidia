@@ -1276,7 +1276,8 @@ mod relay_tests {
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 /// When a snapshot buffer was last taken from or given back to [`POOL`]
-/// ([`crate::host::moment`]), for [`let_go_idle_snapshots`].
+/// ([`crate::host::moment`]), for [`let_go_idle_snapshots`]. Read and
+/// updated while holding the pool lock so a sweep sees the latest use.
 static POOL_USED: AtomicU64 = AtomicU64::new(0);
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one
@@ -1284,8 +1285,8 @@ static POOL_USED: AtomicU64 = AtomicU64::new(0);
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
-    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
         .iter()
@@ -1320,8 +1321,8 @@ fn snapshots_kept() -> usize {
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
-    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
@@ -1359,12 +1360,11 @@ const POOL_PRESSURED_KEPT: usize = 32 << 20;
 fn let_go_idle_snapshots() {
     const IDLE_FRAMES: u64 = 4;
     let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-    let idle = crate::host::long_ago(POOL_USED.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES);
-    let Some(most) = snapshots_to_keep(idle, crate::residency::pressured()) else {
-        return;
-    };
+    let pressured = crate::residency::pressured();
     let gone = {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let idle = crate::host::long_ago(POOL_USED.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES);
+        let Some(most) = snapshots_to_keep(idle, pressured) else { return };
         trim_pool(&mut pool, most)
     };
     // (Given back to the kernel without the lock.)
