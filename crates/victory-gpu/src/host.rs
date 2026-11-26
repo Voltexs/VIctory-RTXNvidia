@@ -7193,7 +7193,7 @@ impl HostList {
         }
         let deferred = self.deferred();
         let seen = deferred.copies.iter().rev().map(|step| match step {
-            Step::Placed(p) => crate::port_rt::Seen::Placed { dst: p.dst, src: p.src, len: p.len, from_upload: p.from_upload() },
+            Step::Placed(p) => crate::port_rt::Seen::Placed { dst: p.dst, src: p.src, len: p.len, from_upload: p.is_from_upload() },
             &Step::Copy(d, _, n) => crate::port_rt::Seen::Writes(d, d + n),
             &Step::GpuWrite(_, a, n) => crate::port_rt::Seen::Writes(a, a + n),
             Step::Run(_) => crate::port_rt::Seen::Anything,

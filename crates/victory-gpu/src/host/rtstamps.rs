@@ -152,16 +152,14 @@ pub(crate) fn after(list: &ID3D12GraphicsCommandList, pair: Option<usize>, kind:
     }
     let mut sums = SUMS.lock().unwrap_or_else(|e| e.into_inner());
     let sums = sums.get_or_insert_with(Default::default);
-    if !sums.names.contains_key(&pso) {
-        sums.names.insert(pso, name.to_owned());
-    }
+    sums.names.entry(pso).or_insert_with(|| name.to_owned());
     sums.pending.push(Pending {
         pair,
         kind,
         pso,
         frame: crate::frame::current(),
     });
-    if sums.pending.len() % 4096 == 0 {
+    if sums.pending.len().is_multiple_of(4096) {
         read(ring, sums, crate::frame::current());
     }
 }
