@@ -1376,6 +1376,19 @@ fn view_bytes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_BYTES").is_none_or(|v| v != "0"))
 }
 
+/// Whether a structured view whose slot has no raw twin gets a copy of its own
+/// bytes when it begins off 16 bytes, as if its slot were read as raw bytes
+/// ([`off_elements`]'s `has_raw_twins`). Off by default: on an RTX 4090, which
+/// takes no heap with raw twins, the title's ring positions sent 265 to 1,968
+/// views a frame there and made 16 to 313 new copies a frame, each a buffer
+/// created under [`crate::shadow::exact`]'s lock; the list threads waited
+/// on it for about 40% of the time and the frame rate fell from 21 to 6.
+/// `VICTORY_STRUCTURED_RAW=1` turns it on.
+fn structured_raw() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRUCTURED_RAW").is_some_and(|v| v == "1"))
+}
+
 /// The copy the buffer view of `[start, start + len)` is made on: `shadow`, the one
 /// its buffer has, or one of the view's own bytes ([`off_elements`]).
 fn view_home(
@@ -1396,7 +1409,7 @@ fn view_home(
     if stride > 0 {
         probe_view_limit();
     }
-    let has_raw_twins = victory_shader::emit::raw_views() != 0;
+    let has_raw_twins = victory_shader::emit::raw_views() != 0 || !structured_raw();
     if !off_elements(offset, stride, raw, element, has_raw_twins) {
         return shadow;
     }
@@ -5595,7 +5608,7 @@ mod tests {
         let (copy, address, bytes) = refreshed.unwrap();
         assert_eq!((address, bytes), (start + 456, 3 * 456));
         assert_eq!(made, copy.buffer, "the descriptor and refresh share a copy");
-        if victory_shader::emit::raw_views() == 0 {
+        if victory_shader::emit::raw_views() == 0 && structured_raw() {
             assert_eq!(copy.span(), (address, bytes));
             eprintln!("the structured slot without a raw twin uses a view-relative copy");
         } else {
