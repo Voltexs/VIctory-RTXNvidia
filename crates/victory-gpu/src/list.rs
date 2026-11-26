@@ -208,7 +208,7 @@ impl Detached {
     /// has completed, without waiting for the full `bury_lag` (64 submissions)
     /// allocator delay: preventing dynamic slot exhaustion at ~10k draws/frame.
     pub(crate) fn release_tables(&mut self) {
-        self._state.tables_done();
+        self.state.tables_done();
     }
 }
 
