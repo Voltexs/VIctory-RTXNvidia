@@ -76,3 +76,9 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Local runtime logs, crash dumps, captures, and per-machine launcher overrides
+*.log
+*.dmp
+/shots/
+/scripts/local.cmd

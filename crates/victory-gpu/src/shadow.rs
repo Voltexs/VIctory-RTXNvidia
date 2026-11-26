@@ -5257,9 +5257,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
-        // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
-        // title's 32-bit graphics heap in place, big or not.
-        if let Some(placed) = crate::port::place_for(key.0, len, false) {
+        // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1` + optional
+        // `VICTORY_PORT_SECTIONS=1`/`noncard`): the title's 32-bit graphics heap
+        // (and contiguous 64-bit XMem section stretches) in place with zero copies.
+        if let Some(placed) = crate::port::place_for_kind(key.0, len, false, big) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
@@ -5636,13 +5637,57 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     Some(shadow)
 }
 
-/// Copies of single buffer views' own bytes ([`exact`]), by (start,
-/// bytes), each with the asking that last took it; and the askings so far.
-#[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+/// A mapped shared buffer recycled from an evicted [`exact`] copy.
+struct ExactBuf(ID3D12Resource, *mut u8, u64);
+// SAFETY: uniquely owned while in the pool; the CPU mapping stays valid for
+// the lifetime of the COM buffer.
+unsafe impl Send for ExactBuf {}
 
-/// Since the last frame line: askings for such copies, and copies made.
-static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+struct ExactState {
+    tick: u64,
+    next_sweep: u64,
+    map: BTreeMap<(u64, u64), (Arc<Shadow>, u64, u64)>,
+    pool: BTreeMap<u64, Vec<ExactBuf>>,
+    pool_bytes: u64,
+}
+
+impl ExactState {
+    const fn new() -> Self {
+        Self {
+            tick: 0,
+            next_sweep: 0,
+            map: BTreeMap::new(),
+            pool: BTreeMap::new(),
+            pool_bytes: 0,
+        }
+    }
+
+    fn take(&mut self, cap: u64) -> Option<ExactBuf> {
+        let bucket = self.pool.get_mut(&cap)?;
+        let buf = bucket.pop()?;
+        self.pool_bytes = self.pool_bytes.saturating_sub(cap);
+        Some(buf)
+    }
+
+    fn put(&mut self, cap: u64, buf: ExactBuf) {
+        const MAX_ITEM: u64 = 1 << 20;
+        const MAX_BYTES: u64 = 64 << 20;
+        if cap <= MAX_ITEM && self.pool_bytes + cap <= MAX_BYTES {
+            self.pool.entry(cap).or_default().push(buf);
+            self.pool_bytes += cap;
+        }
+    }
+}
+
+/// Copies of single buffer views' own bytes ([`exact`]), by (start,
+/// bytes), each with the asking that last took it and its buffer capacity;
+/// plus a size-bucketed pool of recycled shared buffers so NVIDIA runs
+/// (`raw_twins=false`) do not call `CreateCommittedResource` 1,000x/frame.
+static EXACT: Mutex<ExactState> = Mutex::new(ExactState::new());
+
+/// Since the last frame line: askings for such copies, newly allocated copies,
+/// and copies served from the recycled buffer pool.
+static EXACT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
@@ -5659,40 +5704,86 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// refreshes the copy its view's slot shows, `buffer_copy`). Kept by
 /// (start, bytes) for as long as a list or a slot holds it; of the others,
 /// those not asked for lately go once there are many (ring positions
-/// change every frame).
+/// change every frame) and their idle D3D12 buffers are recycled by size.
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for, and the askings an
-    /// idle one stays for.
-    const MANY: usize = 256;
-    const LATELY: u64 = 512;
+    /// idle one stays for. Sized above open-world working sets (~4,500 live
+    /// views, ~4,200 askings/frame on NVIDIA `raw_twins=false`) and throttled
+    /// by `SWEEP_EVERY` so `retain()` never turns into an O(N^2) scan on
+    /// every cache miss under the global mutex.
+    const MANY: usize = 4096;
+    const LATELY: u64 = 16384;
+    const SWEEP_EVERY: u64 = 8192;
+    /// Largest individual buffer capacity kept in the recycled pool.
+    const POOL_MAX_ITEM: u64 = 1 << 20;
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
+    let rounded = len.next_multiple_of(256);
+    let cap = if rounded <= POOL_MAX_ITEM {
+        rounded.next_power_of_two()
+    } else {
+        rounded
+    };
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
+    {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        guard.tick += 1;
+        let now = guard.tick;
+        if let Some((shadow, used, _)) = guard.map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+        if guard.map.len() >= MANY && now >= guard.next_sweep {
+            guard.next_sweep = now + SWEEP_EVERY;
+            // Held by the map alone (no list), its buffer by the copy alone (no
+            // slot shows it), not asked for lately, and idle for >= 100 ms & 4 frames.
+            let mut evicted: Vec<(u64, Arc<Shadow>)> = Vec::new();
+            guard.map.retain(|_, (shadow, used, scap)| {
+                let keep = Arc::strong_count(shadow) > 1
+                    || crate::host::references(&shadow.buffer) > 1
+                    || *used + LATELY > now
+                    || !crate::host::long_ago(shadow.used.load(Ordering::Relaxed), 100, 4);
+                if !keep {
+                    evicted.push((*scap, shadow.clone()));
+                }
+                keep
+            });
+            for (scap, shadow) in evicted {
+                let buf = ExactBuf(shadow.buffer.clone(), shadow.data, shadow.gpu);
+                drop(shadow);
+                guard.put(scap, buf);
+            }
+        }
+        if let Some(ExactBuf(buffer, data, gpu)) = guard.take(cap) {
+            let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+            guard.map.insert((address, len), (shadow.clone(), now, cap));
+            EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
+            OWN_MADE.fetch_add(1, Ordering::Relaxed);
+            return Some(shadow);
+        }
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
-    }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+    // Cold miss: allocate outside `EXACT`'s mutex so recording threads never serialize
+    // behind `CreateCommittedResource`.
+    let (buffer, data) = host()?.shared_buffer(cap)?;
+    crate::host::name(&buffer, || format!("title view {cap:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    guard.tick += 1;
+    let now = guard.tick;
+    if let Some((shadow, used, _)) = guard.map.get_mut(&(address, len)) {
+        *used = now;
+        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        let out = shadow.clone();
+        guard.put(cap, ExactBuf(buffer, data, gpu));
+        return Some(out);
+    }
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    guard.map.insert((address, len), (shadow.clone(), now, cap));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -5705,16 +5796,20 @@ pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    let [asked, made, reused] = [0, 1, 2].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let (kept, pool_mb) = {
+        let g = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        (g.map.len(), g.pool_bytes as f64 / (1024.0 * 1024.0))
+    };
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} new + {:.1} pooled copies per frame, {kept} kept ({pool_mb:.1} MB pooled)",
         asked as f64 / frames,
-        made as f64 / frames
+        made as f64 / frames,
+        reused as f64 / frames,
     );
 }
 

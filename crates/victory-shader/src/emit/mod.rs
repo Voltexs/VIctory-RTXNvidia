@@ -537,12 +537,14 @@ pub fn emit(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
-        // lost the card in a submission of two programs that had just moved to it
-        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // Off unless asked for (`VICTORY_WAVE_WIDE=1` before local waves, or
+        // `VICTORY_WAVE_WIDE=last` only after all narrower/local-wave forms
+        // fail — safe on NVIDIA wave32 so particle shaders keep narrow forms
+        // while wave64 FSR4/compute shaders still build).
+        let wide_val = std::env::var_os("VICTORY_WAVE_WIDE");
+        let wide_on = wide_val.as_deref().is_some_and(|v| v == "1");
+        let wide_last = wide_val.as_deref().is_some_and(|v| v == "last");
+        let mut deep_saved = None;
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -578,6 +580,9 @@ pub fn emit(
                             return again.map(|(shader, _)| shader);
                         }
                     }
+                }
+                if wide_last {
+                    deep_saved = deep;
                 }
                 if strict {
                     break;
@@ -621,6 +626,21 @@ pub fn emit(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        if wide_last {
+            let bases = [
+                deep_saved.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
                 }
             }
         }

@@ -9687,8 +9687,10 @@ impl Host {
             }
         }
         if (p.width, p.height, p.format) != (width, height, format) {
-            // Presents sent ahead hold back buffers until they have run.
+            // Presents sent ahead hold back buffers until they have run and
+            // their command lists are cleared.
             settle_now(WHY_SYNC);
+            p.ahead.clear();
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain

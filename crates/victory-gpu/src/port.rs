@@ -102,17 +102,84 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// touch it, their bytes.
 static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
+/// `VICTORY_PORT_SECTIONS`: extends renderer port #1's zero-copy second-view
+/// `OpenExistingHeapFromAddress1` mapping beyond `< 4 GiB` (`LOW`) to 64-bit
+/// contiguous XMem section stretches (`Cover::Run`):
+/// - unset / `0`: off (`< 4 GiB` constants heap only, as before)
+/// - `1` / `all`: all contiguous 64-bit section buffers up to `VICTORY_PORT_SECTIONS_MB`
+/// - `noncard`: only contiguous 64-bit section buffers that would NOT go to local VRAM
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SectionsMode {
+    Off,
+    All,
+    NonCard,
+}
+
+pub(crate) fn sections_mode() -> SectionsMode {
+    static MODE: std::sync::OnceLock<SectionsMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_PORT_SECTIONS").ok().as_deref().map(str::trim) {
+        Some("1") | Some("all") => SectionsMode::All,
+        Some("noncard") => SectionsMode::NonCard,
+        _ => SectionsMode::Off,
+    })
+}
+
+/// Cap on total `>= 4 GiB` section bytes opened in place (`VICTORY_PORT_SECTIONS_MB`,
+/// default 1024 MiB) so working set stays bounded on 32 GB hosts.
+fn sections_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_PORT_SECTIONS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+            << 20
+    })
+}
+
+/// Bytes currently opened in place for `>= 4 GiB` sections.
+static HIGH_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// Whether `[at, at + len)` may be ported: in the title's 32-bit graphics
-/// memory.
+/// memory (`VICTORY_PORT_CONSTANTS=1`), or any contiguous 64-bit XMem section
+/// stretch when `VICTORY_PORT_SECTIONS` is enabled (excluding windows outside
+/// buffers unless below 4 GiB).
+#[cfg(test)]
 pub(crate) fn wanted(at: u64, len: u64) -> bool {
-    on() && at.checked_add(len).is_some_and(|end| end <= LOW && len > 0)
+    wanted_for(at, len, false, false)
+}
+
+pub(crate) fn wanted_for(at: u64, len: u64, window: bool, card_candidate: bool) -> bool {
+    let Some(end) = at.checked_add(len).filter(|_| len > 0) else {
+        return false;
+    };
+    if on() && end <= LOW {
+        return true;
+    }
+    if window {
+        return false;
+    }
+    match sections_mode() {
+        SectionsMode::Off => false,
+        SectionsMode::All => true,
+        SectionsMode::NonCard => !card_candidate,
+    }
 }
 
 /// Title memory `[start, start + len)` in place, if [`wanted`] and the
 /// memory is one stretch of a section: a buffer placed in the region's
 /// heap. `None` leaves the caller to do what it did before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if !wanted(start, len) {
+    place_for_kind(start, len, window, false)
+}
+
+pub(crate) fn place_for_kind(start: u64, len: u64, window: bool, card_candidate: bool) -> Option<Placed> {
+    if !wanted_for(start, len, window, card_candidate) {
+        return None;
+    }
+    // For >= 4 GiB stretches, skip cheaply before taking REGIONS lock if the
+    // memory is not a contiguous section run (e.g. private or scattered).
+    if start >= LOW && !matches!(cover(start as usize, len as usize), crate::inplace::Cover::Run(..)) {
         return None;
     }
     let host = crate::host::host()?;
@@ -174,18 +241,25 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
         return Err((3, format!("not one stretch of a section: {:?}", cover(at as usize, (end - at) as usize))));
     };
     // The whole stretch, kept to what may be ported: the next buffer in it
-    // finds the region made.
+    // finds the region made. For >= 4 GiB sections (such as the 3,977 MB pool),
+    // trim large stretches to just the requested buffer `[at, end)` so we never
+    // pin hundreds of untouched megabytes into the working set.
     let (mut first, mut bytes, mut offset) = (first as u64, bytes as u64, offset);
     if first < LOW && first + bytes > LOW {
         bytes = LOW.saturating_sub(first);
     }
-    if bytes > MOST {
+    let high = at >= LOW;
+    let limit = if high { 64 << 20 } else { MOST };
+    if bytes > limit {
         // Only what was asked for.
         offset += at - first;
         (first, bytes) = (at, end - at);
     }
     if bytes > MOST {
         return Err((3, format!("{bytes:#x} bytes, over the most of a region")));
+    }
+    if high && HIGH_BYTES.load(Ordering::Relaxed).saturating_add(bytes) > sections_budget() {
+        return Err((3, format!("{bytes:#x} bytes over VICTORY_PORT_SECTIONS_MB")));
     }
     if first > at || first + bytes < end || offset % K64 != 0 {
         return Err((3, format!("the stretch {first:#x}+{bytes:#x} does not hold it")));
@@ -206,6 +280,9 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     }
     match crate::inplace::open(device, crate::inplace::From::Part(view, bytes as usize)) {
         Ok(heap) => {
+            if high {
+                HIGH_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            }
             tracing::info!(
                 start = format_args!("{first:#x}"),
                 bytes,
@@ -256,7 +333,19 @@ pub(crate) fn forget(at: usize, len: usize) {
     }
     let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
     let before = regions.len();
-    regions.retain(|r| r.end <= at || r.start >= end);
+    let mut freed_high = 0u64;
+    regions.retain(|r| {
+        let keep = r.end <= at || r.start >= end;
+        if !keep && r.start >= LOW {
+            freed_high = freed_high.saturating_add(r.end.saturating_sub(r.start));
+        }
+        keep
+    });
+    if freed_high != 0 {
+        let _ = HIGH_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(freed_high))
+        });
+    }
     STATS[7].fetch_add((before - regions.len()) as u64, Ordering::Relaxed);
     bounds(&regions);
 }
@@ -286,16 +375,24 @@ pub(crate) fn copied(dst: usize, src: usize, len: usize) {
 /// For the frame-rate line: what is in place, and what of ours read or
 /// wrote it on the CPU per frame.
 pub(crate) fn log(frames: f64) {
-    if !on() {
+    let sec = sections_mode();
+    if !on() && sec == SectionsMode::Off {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     let per: Vec<f64> = STATS[9..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let sec_label = match sec {
+        SectionsMode::Off => "off",
+        SectionsMode::All => "all",
+        SectionsMode::NonCard => "noncard",
+    };
+    let high_mb = HIGH_BYTES.load(Ordering::Relaxed) >> 20;
     tracing::info!(
-        "renderer port 1 (VICTORY_PORT_CONSTANTS=1): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
+        "renderer port 1 (VICTORY_PORT_CONSTANTS={}, VICTORY_PORT_SECTIONS={sec_label}, high {high_mb} MB): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
          (no host copy, nothing sent up or fetched back for them); per frame on the CPU: {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies \
          touching them ({:.1} KB); since the start refused: {} not one stretch of a section, {} not committed, {} by the host, {} no buffer; {} regions \
          forgotten (other pages mapped there)",
+        u8::from(on()),
         s[0],
         s[1] >> 20,
         s[2],

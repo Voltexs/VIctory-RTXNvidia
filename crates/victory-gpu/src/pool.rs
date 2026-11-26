@@ -84,7 +84,22 @@ fn now() -> u64 {
     crate::host::now_ms()
 }
 
+/// Whether VRAM textures are cut from 64 MiB blocks (`VICTORY_TEXTURE_POOL=0`
+/// or `VICTORY_TEXTURE_POOL=staging` turns VRAM texture blocks off).
 pub(crate) fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_POOL")
+            .ok()
+            .is_none_or(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "staging"))
+    })
+}
+
+/// Whether system-RAM texture staging upload buffers are cut from 64 MiB blocks
+/// (`VICTORY_TEXTURE_POOL=0` turns both off; `VICTORY_TEXTURE_POOL=staging`
+/// keeps staging pooled while avoiding 64 MiB VRAM texture block fragmentation
+/// on 8 GB GPUs).
+pub(crate) fn staging_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_none_or(|v| v != "0"))
 }
@@ -389,7 +404,7 @@ impl Drop for StagingPiece {
 /// `bytes` of upload memory, all zeros: the buffer it lies in, where in
 /// that buffer, and its mapping. `None`: not pooled.
 pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
-    if !on() {
+    if !staging_on() {
         return None;
     }
     // Copies from a buffer begin at multiples of 512.
