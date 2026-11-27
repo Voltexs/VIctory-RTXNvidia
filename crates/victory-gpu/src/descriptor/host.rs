@@ -3177,9 +3177,6 @@ impl HostHeap {
             host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
         }
         self.twin_made(index, true);
-        // A constant buffer, as every other writer of a slot says: a slot
-        // reused from a structured or typed view must not keep its word.
-        self.write_stride(index, 0);
         self.keep(index, Some(buffer.clone()));
         true
     }

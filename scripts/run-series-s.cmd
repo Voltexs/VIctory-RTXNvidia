@@ -42,7 +42,8 @@ set VICTORY_INDIRECT_BATCH=2
 set VICTORY_CARD_STEPS=2
 set VICTORY_MAP_THREADS=1
 set VICTORY_TITLE_PRIORITIES=0
-set VICTORY_CARD_AWAKE=1
+set VICTORY_CARD_AWAKE=0
+set VICTORY_PLACED_ORDER=1
 set VICTORY_SHOW_AFTER=1
 set VICTORY_AMBIENT=0.8
 set VICTORY_LATE_WAIT=3
@@ -57,21 +58,22 @@ set VICTORY_PORT_GUARD=1
 set VICTORY_PORT_JOURNAL=1
 set VICTORY_PORT_RT=1
 
-rem 8 GB VRAM + 32 GB RAM tuning:
+rem 8 GB VRAM + 32 GB RAM NVIDIA RTX tuning:
+rem - VICTORY_CARD_AWAKE=0: disables AMD-only compute-queue clock spinner on NVIDIA
 rem - VICTORY_WAIT_RESIDENT=0: disables synchronous copy-queue fence stalls under ASIDE lock
-rem - VICTORY_TEXTURE_POOL=staging: keeps GPU textures unpooled to eliminate ~2.5 GB VRAM fragmentation while pooling RAM staging
+rem - VICTORY_TEXTURE_POOL=staging: avoids 64 MiB VRAM block fragmentation while pooling RAM staging (4 KiB small textures default on NVIDIA)
 rem - VICTORY_RESIDENCY=1 + VICTORY_KEEP_FREED=0: keeps 32 GB host RAM commit healthy & reclaims idle staging/scratch
 rem - VICTORY_LEVELS_MIN_KB=128: reclaims ~3.7 GB VRAM on unmapped MIP0 levels of streamed textures
 rem - VICTORY_TEXTURE_CATCHUP=0 + STAGE_MB=48 / STAGE_MS=12: stops flying/moving texture spikes (was 125-320 ms/frame)
 rem - VICTORY_TEXTURE_LOOK_MS=500 + AWAY_MS=8000: fast pop-in without premature slot unloads / neutral flashing
-rem - VICTORY_CARD_BUFFERS_MB=1280: uses reclaimed VRAM headroom to keep hot GPU buffers in 448 GB/s GDDR6
-rem - VICTORY_LAND_THREADS=8: parallelizes copy-back merge workers
+rem - VICTORY_CARD_RESERVE_BUDGETS=1 + BUFFERS_MIN_KB=64 + BUFFERS_MB=1280 + WINDOWS_MB=384: keeps hot buffers & windows in 448 GB/s GDDR6
 set VICTORY_WAIT_RESIDENT=0
 set VICTORY_TEXTURE_POOL=staging
 set VICTORY_RESIDENCY=1
 set VICTORY_KEEP_FREED=0
-set VICTORY_THIN_THREADS=6
-set VICTORY_LAND_THREADS=8
+set VICTORY_THIN_THREADS=8
+set VICTORY_UNDER_THREADS=6
+set VICTORY_LAND_THREADS=6
 set VICTORY_LEVELS_ON_DEMAND=1
 set VICTORY_LEVELS_MIN_KB=128
 set VICTORY_TEXTURE_CATCHUP=0
@@ -81,9 +83,10 @@ set VICTORY_TEXTURE_ROOM_PERCENT=92
 set VICTORY_TEXTURE_STAGE_MB=48
 set VICTORY_TEXTURE_STAGE_MS=12
 set VICTORY_CARD_ROOM_FOR_TARGETS_MB=1400
-set VICTORY_CARD_BUFFERS_MIN_KB=256
+set VICTORY_CARD_RESERVE_BUDGETS=1
+set VICTORY_CARD_BUFFERS_MIN_KB=64
 set VICTORY_CARD_BUFFERS_MB=1280
-set VICTORY_CARD_WINDOWS_MB=0
+set VICTORY_CARD_WINDOWS_MB=384
 
 pushd "%ROOT%"
 "%ROOT%\target\release\victory.exe" run "%GAME%" --console series-s --execute
